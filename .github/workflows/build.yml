@@ -1,0 +1,595 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Project config
+        run: |
+          set -e
+          mkdir -p "proj/$(dirname settings.gradle.kts)"
+          cat > proj/settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "FloatingCounter"
+          include(":app")
+          EOF_FILE
+          mkdir -p "proj/$(dirname build.gradle.kts)"
+          cat > proj/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p "proj/$(dirname gradle.properties)"
+          cat > proj/gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx3g
+          EOF_FILE
+          mkdir -p "proj/$(dirname app/build.gradle.kts)"
+          cat > proj/app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.tasbeeh"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.tasbeeh"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p "proj/$(dirname app/src/main/AndroidManifest.xml)"
+          cat > proj/app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application
+                  android:label="Floating Counter"
+                  android:icon="@android:drawable/btn_star_big_on"
+                  android:theme="@android:style/Theme.Material.NoActionBar"
+                  android:allowBackup="false">
+                  <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".OverlayService" android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="floating_counter" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+      - name: Code - Core
+        run: |
+          set -e
+          mkdir -p "proj/$(dirname app/src/main/java/com/example/tasbeeh/Core.kt)"
+          cat > proj/app/src/main/java/com/example/tasbeeh/Core.kt <<'EOF_FILE'
+          package com.example.tasbeeh
+
+          import android.content.Context
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioTrack
+          import android.os.Build
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.os.VibratorManager
+
+          class Prefs(ctx: Context) {
+              private val p = ctx.getSharedPreferences("counter", Context.MODE_PRIVATE)
+              private fun w(k: String, v: Any) {
+                  p.edit().apply {
+                      when (v) {
+                          is Int -> putInt(k, v)
+                          is Boolean -> putBoolean(k, v)
+                          is Float -> putFloat(k, v)
+                          is String -> putString(k, v)
+                      }
+                  }.apply()
+              }
+              var count: Int get() = p.getInt("count", 0); set(v) = w("count", v)
+              var active: String get() = p.getString("active", "") ?: ""; set(v) = w("active", v)
+              var saved: String get() = p.getString("saved", "") ?: ""; set(v) = w("saved", v)
+              var hapticOn: Boolean get() = p.getBoolean("hOn", true); set(v) = w("hOn", v)
+              var hapticLevel: Int get() = p.getInt("hLvl", 50); set(v) = w("hLvl", v)
+              var beepOn: Boolean get() = p.getBoolean("bOn", true); set(v) = w("bOn", v)
+              var beepLevel: Int get() = p.getInt("bLvl", 60); set(v) = w("bLvl", v)
+              var scale: Float get() = p.getFloat("scale", 1f); set(v) = w("scale", v)
+              var appW: Int get() = p.getInt("appW", 0); set(v) = w("appW", v)
+              var posX: Int get() = p.getInt("px", 40); set(v) = w("px", v)
+              var posY: Int get() = p.getInt("py", 300); set(v) = w("py", v)
+              var hint: Boolean get() = p.getBoolean("hint", false); set(v) = w("hint", v)
+          }
+
+          class Feedback(ctx: Context, private val prefs: Prefs) {
+              @Suppress("DEPRECATION")
+              private val vib: Vibrator =
+                  if (Build.VERSION.SDK_INT >= 31)
+                      (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+                  else ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+
+              private fun synth(freqs: IntArray, ms: Int): AudioTrack {
+                  val sr = 22050; val n = sr * ms / 1000
+                  val buf = ShortArray(n * freqs.size)
+                  var k = 0
+                  for (f in freqs) for (i in 0 until n) {
+                      val env = minOf(1f, minOf(i, n - 1 - i) / (sr * .008f))
+                      buf[k++] = (Math.sin(2.0 * Math.PI * f * i / sr) * env * 14000).toInt().toShort()
+                  }
+                  return AudioTrack.Builder()
+                      .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+                      .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                          .setSampleRate(sr).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+                      .setBufferSizeInBytes(buf.size * 2).setTransferMode(AudioTrack.MODE_STATIC).build()
+                      .also { it.write(buf, 0, buf.size) }
+              }
+
+              private val tickL = lazy { synth(intArrayOf(1000), 45) }              // normal count: short single beep
+              private val mileL = lazy { synth(intArrayOf(659, 880, 1319), 120) }  // every 100: rising 3-note chime
+
+              private fun play(l: Lazy<AudioTrack>) {
+                  if (!prefs.beepOn || prefs.beepLevel == 0) return
+                  runCatching { val t = l.value; t.stop(); t.reloadStaticData(); t.setVolume(prefs.beepLevel / 100f); t.play() }
+              }
+
+              fun haptic(ms: Long, amp: Int) {
+                  if (prefs.hapticOn && prefs.hapticLevel > 0)
+                      vib.vibrate(VibrationEffect.createOneShot(ms, amp.coerceIn(1, 255)))
+              }
+
+              fun tick() { val l = prefs.hapticLevel; haptic(8L + l / 3, l * 255 / 100); play(tickL) }
+
+              fun milestone() {
+                  if (prefs.hapticOn && prefs.hapticLevel > 0) {
+                      val a = (prefs.hapticLevel * 255 / 100).coerceIn(100, 255)
+                      vib.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 70, 60, 70, 60, 180), intArrayOf(0, a, 0, a, 0, a), -1))
+                  }
+                  play(mileL)
+              }
+
+              fun step(): Int {
+                  prefs.count = (prefs.count + 1) % 100000
+                  if (prefs.count % 100 == 0) milestone() else tick()
+                  return prefs.count
+              }
+
+              fun release() {
+                  if (tickL.isInitialized()) tickL.value.release()
+                  if (mileL.isInitialized()) mileL.value.release()
+              }
+          }
+          EOF_FILE
+      - name: Code - CounterView
+        run: |
+          set -e
+          mkdir -p "proj/$(dirname app/src/main/java/com/example/tasbeeh/CounterView.kt)"
+          cat > proj/app/src/main/java/com/example/tasbeeh/CounterView.kt <<'EOF_FILE'
+          package com.example.tasbeeh
+
+          import android.content.Context
+          import android.graphics.*
+          import android.view.*
+          import kotlin.math.hypot
+
+          class CounterView(ctx: Context) : View(ctx) {
+              interface L {
+                  fun onTap(); fun onReset(); fun onLongPress()
+                  fun onScale(f: Float); fun onDrag(dx: Float, dy: Float)
+              }
+
+              var listener: L? = null
+              var count = 0
+                  set(v) { field = v; invalidate() }
+
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val slop = ViewConfiguration.get(ctx).scaledTouchSlop
+              private var downX = 0f; private var downY = 0f; private var lastX = 0f; private var lastY = 0f
+              private var moved = false; private var multi = false; private var pressed = false
+              private var confirming = false; private var longFired = false
+              private val longRun = Runnable {
+                  longFired = true; pressed = false; invalidate()
+                  performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                  listener?.onLongPress()
+              }
+              private val sg = ScaleGestureDetector(ctx, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                  override fun onScale(d: ScaleGestureDetector): Boolean { listener?.onScale(d.scaleFactor); return true }
+              }).apply { isQuickScaleEnabled = false }
+
+              private fun near(x: Float, y: Float, cx: Float, cy: Float, r: Float) = hypot(x - cx, y - cy) <= r
+
+              override fun onDraw(c: Canvas) {
+                  val w = width.toFloat(); val h = height.toFloat()
+                  paint.style = Paint.Style.FILL
+                  paint.shader = LinearGradient(0f, 0f, 0f, h, 0xFF333333.toInt(), 0xFF050505.toInt(), Shader.TileMode.CLAMP)
+                  c.drawRoundRect(0f, 0f, w, h, w * .32f, w * .32f, paint)
+                  paint.shader = null
+
+                  val l = RectF(.13f * w, .14f * h, .87f * w, .37f * h)
+                  paint.color = 0xFF7C8A86.toInt()
+                  c.drawRoundRect(l, w * .04f, w * .04f, paint)
+                  paint.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+                  paint.textAlign = Paint.Align.RIGHT
+                  paint.textSize = minOf(l.height() * .8f, l.width() / 3.3f)
+                  val ty = l.centerY() + paint.textSize * .35f; val tx = l.right - w * .03f
+                  paint.color = 0x22000000; c.drawText("88888", tx, ty, paint)
+                  paint.color = 0xFF111111.toInt(); c.drawText(count.toString(), tx, ty, paint)
+
+                  val bx = .5f * w; val by = .68f * h; val br = .25f * w
+                  paint.shader = RadialGradient(bx, by, br,
+                      if (pressed) 0xFFBDBDBD.toInt() else 0xFFF2F2F2.toInt(), 0xFF9E9E9E.toInt(), Shader.TileMode.CLAMP)
+                  c.drawCircle(bx, by, if (pressed) br * .97f else br, paint)
+                  paint.shader = null
+                  paint.color = 0xFFE0E0E0.toInt()
+                  c.drawCircle(.8f * w, .5f * h, .075f * w, paint)   // reset
+
+                  if (confirming) {
+                      paint.color = 0xEE111111.toInt(); c.drawRoundRect(0f, 0f, w, h, w * .32f, w * .32f, paint)
+                      paint.typeface = Typeface.DEFAULT_BOLD; paint.textAlign = Paint.Align.CENTER
+                      paint.color = Color.WHITE; paint.textSize = w * .11f
+                      c.drawText("RESET?", w * .5f, h * .34f, paint)
+                      paint.color = 0xFFC62828.toInt(); c.drawCircle(.3f * w, .62f * h, .16f * w, paint)
+                      paint.color = 0xFF616161.toInt(); c.drawCircle(.7f * w, .62f * h, .16f * w, paint)
+                      paint.color = Color.WHITE; paint.textSize = w * .075f
+                      c.drawText("YES", .3f * w, .62f * h + w * .027f, paint)
+                      c.drawText("NO", .7f * w, .62f * h + w * .027f, paint)
+                  }
+              }
+
+              private fun tap(x: Float, y: Float, w: Float, h: Float) {
+                  if (confirming) {
+                      confirming = false
+                      if (near(x, y, .3f * w, .62f * h, .18f * w)) listener?.onReset()
+                  } else when {
+                      near(x, y, .5f * w, .68f * h, .27f * w) -> listener?.onTap()
+                      near(x, y, .8f * w, .5f * h, .1f * w) -> confirming = true
+                  }
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  sg.onTouchEvent(e)
+                  val w = width.toFloat(); val h = height.toFloat()
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          parent?.requestDisallowInterceptTouchEvent(true)
+                          downX = e.rawX; downY = e.rawY; lastX = downX; lastY = downY
+                          moved = false; multi = false; longFired = false
+                          val onSmall = near(e.x, e.y, .8f * w, .5f * h, .1f * w)
+                          pressed = !confirming && near(e.x, e.y, .5f * w, .68f * h, .27f * w)
+                          if (!confirming && !onSmall) postDelayed(longRun, 700)
+                          invalidate()
+                      }
+                      MotionEvent.ACTION_POINTER_DOWN -> { multi = true; pressed = false; removeCallbacks(longRun); invalidate() }
+                      MotionEvent.ACTION_MOVE -> if (!multi) {
+                          if (!moved && hypot(e.rawX - downX, e.rawY - downY) > slop) {
+                              moved = true; pressed = false; removeCallbacks(longRun); invalidate()
+                          }
+                          if (moved) listener?.onDrag(e.rawX - lastX, e.rawY - lastY)
+                          lastX = e.rawX; lastY = e.rawY
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          removeCallbacks(longRun)
+                          if (!moved && !multi && !longFired) tap(e.x, e.y, w, h)
+                          pressed = false; invalidate()
+                      }
+                      MotionEvent.ACTION_CANCEL -> { removeCallbacks(longRun); pressed = false; invalidate() }
+                  }
+                  return true
+              }
+          }
+          EOF_FILE
+      - name: Code - OverlayService
+        run: |
+          set -e
+          mkdir -p "proj/$(dirname app/src/main/java/com/example/tasbeeh/OverlayService.kt)"
+          cat > proj/app/src/main/java/com/example/tasbeeh/OverlayService.kt <<'EOF_FILE'
+          package com.example.tasbeeh
+
+          import android.app.*
+          import android.content.Intent
+          import android.graphics.PixelFormat
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.WindowManager
+          import kotlin.math.roundToInt
+
+          class OverlayService : Service(), CounterView.L {
+              companion object { @Volatile var running = false }
+
+              private lateinit var wm: WindowManager
+              private lateinit var view: CounterView
+              private lateinit var lp: WindowManager.LayoutParams
+              private lateinit var prefs: Prefs
+              private lateinit var fb: Feedback
+              private var scale = 1f
+              private var baseW = 0
+              private val sw get() = resources.displayMetrics.widthPixels
+              private val sh get() = resources.displayMetrics.heightPixels
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  running = true
+                  prefs = Prefs(this); fb = Feedback(this, prefs)
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  startForeground(1, notification())
+                  baseW = (200 * resources.displayMetrics.density).toInt()
+                  scale = prefs.scale.coerceIn(.5f, maxScale())
+                  view = CounterView(this).apply { listener = this@OverlayService; count = prefs.count }
+                  val w = (baseW * scale).toInt()
+                  lp = WindowManager.LayoutParams(
+                      w, (w * 1.2f).toInt(),
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START; x = prefs.posX; y = prefs.posY }
+                  clamp(); wm.addView(view, lp)
+              }
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i?.action == "STOP") stopSelf()
+                  return START_STICKY
+              }
+
+              private fun maxScale() = minOf(3f, sw.toFloat() / baseW)
+
+              private fun clamp() {
+                  lp.x = lp.x.coerceIn(0, maxOf(0, sw - lp.width))
+                  lp.y = lp.y.coerceIn(0, maxOf(0, sh - lp.height))
+              }
+
+              override fun onTap() { view.count = fb.step() }
+              override fun onReset() { prefs.count = 0; view.count = 0; fb.haptic(60, 200) }
+
+              override fun onLongPress() {   // long-press the floating counter: back to the app
+                  startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  stopSelf()
+              }
+
+              override fun onScale(f: Float) {
+                  val ow = lp.width; val oh = lp.height
+                  scale = (scale * f).coerceIn(.5f, maxScale())
+                  lp.width = (baseW * scale).toInt(); lp.height = (lp.width * 1.2f).toInt()
+                  lp.x -= (lp.width - ow) / 2; lp.y -= (lp.height - oh) / 2
+                  clamp(); wm.updateViewLayout(view, lp); prefs.scale = scale
+              }
+
+              override fun onDrag(dx: Float, dy: Float) {
+                  lp.x += dx.roundToInt(); lp.y += dy.roundToInt()
+                  clamp(); wm.updateViewLayout(view, lp)
+              }
+
+              private fun notification(): Notification {
+                  getSystemService(NotificationManager::class.java)
+                      .createNotificationChannel(NotificationChannel("c", "Floating counter", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(this, 0,
+                      Intent(this, OverlayService::class.java).setAction("STOP"), PendingIntent.FLAG_IMMUTABLE)
+                  val open = PendingIntent.getActivity(this, 1,
+                      Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                  return Notification.Builder(this, "c")
+                      .setSmallIcon(android.R.drawable.btn_star_big_on)
+                      .setContentTitle("Floating counter is on")
+                      .setContentIntent(open)
+                      .addAction(0, "Stop", stop)
+                      .build()
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  prefs.posX = lp.x; prefs.posY = lp.y
+                  runCatching { wm.removeView(view) }
+                  fb.release()
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+      - name: Code - MainActivity
+        run: |
+          set -e
+          mkdir -p "proj/$(dirname app/src/main/java/com/example/tasbeeh/MainActivity.kt)"
+          cat > proj/app/src/main/java/com/example/tasbeeh/MainActivity.kt <<'EOF_FILE'
+          package com.example.tasbeeh
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.TextUtils
+          import android.view.Gravity
+          import android.widget.*
+          import java.text.SimpleDateFormat
+          import java.util.*
+
+          class MainActivity : Activity(), CounterView.L {
+              private lateinit var prefs: Prefs
+              private lateinit var fb: Feedback
+              private lateinit var cv: CounterView
+              private lateinit var nameTv: TextView
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun rows() = prefs.saved.lines().filter { it.isNotBlank() }
+              private fun label(t: String) = TextView(this).apply {
+                  text = t; setTextColor(0xFFAAAAAA.toInt()); setPadding(0, dp(12), 0, 0)
+              }
+              private fun circle(t: String, f: () -> Unit) = TextView(this).apply {
+                  text = t; textSize = 22f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                  background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0xFF1B5E20.toInt()) }
+                  layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
+                  setOnClickListener { f() }
+              }
+              private fun LinearLayout.sw(t: String, on: Boolean, f: (Boolean) -> Unit) {
+                  addView(Switch(context).apply {
+                      text = t; isChecked = on; setPadding(0, dp(12), 0, 0)
+                      setOnCheckedChangeListener { _, v -> f(v) }
+                  })
+              }
+              private fun LinearLayout.seek(t: String, v: Int, f: (Int) -> Unit, done: () -> Unit) {
+                  addView(label(t))
+                  addView(SeekBar(context).apply {
+                      max = 100; progress = v
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, user: Boolean) { if (user) f(p) }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) { done() }
+                      })
+                  })
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  prefs = Prefs(this); fb = Feedback(this, prefs)
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+
+                  val scrW = resources.displayMetrics.widthPixels
+                  val w = (if (prefs.appW > 0) prefs.appW else minOf(scrW - dp(48), dp(300))).coerceIn(dp(150), scrW - dp(24))
+                  val root = FrameLayout(this).apply { setBackgroundColor(0xFF202020.toInt()) }
+                  cv = CounterView(this).apply { listener = this@MainActivity; count = prefs.count }
+                  root.addView(cv, FrameLayout.LayoutParams(w, (w * 1.2f).toInt(), Gravity.CENTER))
+
+                  val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(16), dp(16), 0) }
+                  nameTv = TextView(this).apply {
+                      gravity = Gravity.CENTER; setTextColor(0xFF9E9E9E.toInt()); textSize = 16f
+                      maxLines = 1; ellipsize = TextUtils.TruncateAt.END
+                  }
+                  bar.addView(circle("☰") { showLibrary() })
+                  bar.addView(nameTv, LinearLayout.LayoutParams(0, -2, 1f))
+                  bar.addView(circle("⚙") { showSettings() })
+                  root.addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+                  setContentView(root)
+
+                  if (!prefs.hint) {
+                      Toast.makeText(this, "Long-press the counter to float it over other apps", Toast.LENGTH_LONG).show()
+                      prefs.hint = true
+                  }
+              }
+
+              override fun onResume() { super.onResume(); cv.count = prefs.count; nameTv.text = prefs.active }
+              override fun onDestroy() { fb.release(); super.onDestroy() }
+
+              // ---- counter callbacks ----
+              override fun onTap() { cv.count = fb.step() }
+              override fun onReset() { prefs.count = 0; cv.count = 0; fb.haptic(60, 200) }
+              override fun onDrag(dx: Float, dy: Float) {}
+              override fun onScale(f: Float) {
+                  val p = cv.layoutParams
+                  val w = (p.width * f).toInt().coerceIn(dp(150), resources.displayMetrics.widthPixels - dp(24))
+                  p.width = w; p.height = (w * 1.2f).toInt(); cv.layoutParams = p; prefs.appW = w
+              }
+              override fun onLongPress() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Allow \"Display over other apps\", then long-press again", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      return
+                  }
+                  if (!OverlayService.running) startForegroundService(Intent(this, OverlayService::class.java))
+                  moveTaskToBack(true)
+              }
+
+              // ---- settings ----
+              private fun showSettings() {
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), dp(8)) }
+                  box.sw("Vibration", prefs.hapticOn) { prefs.hapticOn = it }
+                  box.seek("Vibration strength", prefs.hapticLevel, { prefs.hapticLevel = it }) { fb.tick() }
+                  box.sw("Beep sound", prefs.beepOn) { prefs.beepOn = it }
+                  box.seek("Beep volume", prefs.beepLevel, { prefs.beepLevel = it }) { fb.tick() }
+                  box.addView(Button(this).apply { text = "TEST 100-COUNT SOUND"; setOnClickListener { fb.milestone() } })
+                  AlertDialog.Builder(this).setTitle("Settings").setView(ScrollView(this).apply { addView(box) })
+                      .setPositiveButton("Done", null).show()
+              }
+
+              // ---- library ----
+              private fun showLibrary() {
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), dp(8)) }
+                  val dlg = AlertDialog.Builder(this).setTitle("Library").setView(ScrollView(this).apply { addView(box) })
+                      .setNegativeButton("Close", null).create()
+                  box.addView(Button(this).apply { text = "SAVE CURRENT (${prefs.count})"; setOnClickListener { dlg.dismiss(); askSave() } })
+                  if (rows().isEmpty()) box.addView(label("Nothing saved yet"))
+                  for (r in rows()) {
+                      val p = r.split("|")
+                      val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(10), 0, dp(10)) }
+                      row.addView(TextView(this).apply {
+                          text = "${p[0]} — ${p[1]}\n${p[2]}"; textSize = 16f
+                          setOnClickListener {   // continue counting from the saved value
+                              prefs.count = p[1].toInt(); prefs.active = p[0]
+                              cv.count = prefs.count; nameTv.text = p[0]; dlg.dismiss()
+                          }
+                      }, LinearLayout.LayoutParams(0, -2, 1f))
+                      row.addView(TextView(this).apply {
+                          text = "✕"; textSize = 20f; setPadding(dp(16), 0, dp(8), 0)
+                          setOnClickListener {
+                              AlertDialog.Builder(this@MainActivity).setMessage("Delete ${p[0]}?")
+                                  .setPositiveButton("Delete") { _, _ ->
+                                      prefs.saved = rows().filter { it != r }.joinToString("\n"); dlg.dismiss(); showLibrary()
+                                  }.setNegativeButton("Cancel", null).show()
+                          }
+                      })
+                      box.addView(row)
+                  }
+                  dlg.show()
+              }
+
+              private fun askSave() {
+                  val et = EditText(this).apply { hint = "Name"; setText(prefs.active) }
+                  AlertDialog.Builder(this).setTitle("Save ${prefs.count}").setView(et)
+                      .setPositiveButton("Save") { _, _ ->
+                          val name = et.text.toString().replace(Regex("[|\n]"), " ").trim().ifBlank { "Counter" }
+                          val ts = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date())
+                          prefs.saved = (listOf("$name|${prefs.count}|$ts") +
+                              rows().filter { !it.substringBefore("|").equals(name, true) }).joinToString("\n")
+                          prefs.active = name; nameTv.text = name
+                          Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()
+                      }.setNegativeButton("Cancel", null).show()
+              }
+          }
+          EOF_FILE
+      - name: Build APK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          cd proj
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FloatingCounter-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp proj/app/build/outputs/apk/debug/app-debug.apk FloatingCounter.apk
+          gh release create "build-${{ github.run_number }}" FloatingCounter.apk --repo "${{ github.repository }}" --title "Build ${{ github.run_number }}" --notes "Install FloatingCounter.apk"
+
